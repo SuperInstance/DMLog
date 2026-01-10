@@ -911,7 +911,7 @@ class TrainingDataCollector:
     ) -> None:
         """
         Export character data to JSON file
-        
+
         Args:
             character_id: Character to export
             output_path: Output file path
@@ -921,7 +921,7 @@ class TrainingDataCollector:
             decisions = self.get_decisions_for_character(character_id)
         else:
             decisions = self.get_training_eligible_decisions(character_id)
-        
+
         export_data = {
             "character_id": character_id,
             "export_timestamp": datetime.utcnow().isoformat(),
@@ -929,11 +929,308 @@ class TrainingDataCollector:
             "decisions": decisions,
             "statistics": self.get_statistics(character_id)
         }
-        
+
         with open(output_path, 'w') as f:
             json.dump(export_data, f, indent=2)
-        
+
         logger.info(f"Exported {len(decisions)} decisions to {output_path}")
+
+    # ========================================================================
+    # Phase 7.2.2: QLoRA Training Data Export
+    # ========================================================================
+
+    def export_for_qlora(
+        self,
+        character_id: str,
+        output_path: str,
+        format: str = "jsonl",
+        min_confidence: float = 0.3,
+        min_quality: float = 0.4,
+        include_teaching_moments: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Export training data in QLoRA-compatible format (Phase 7.2.2)
+
+        Args:
+            character_id: Character to export
+            output_path: Output file path
+            format: Output format ('jsonl' or 'parquet')
+            min_confidence: Minimum confidence threshold
+            min_quality: Minimum quality score threshold
+            include_teaching_moments: Always include teaching moments
+
+        Returns:
+            Export statistics
+        """
+        decisions = self.get_training_eligible_decisions(character_id)
+
+        # Filter by quality
+        filtered_decisions = []
+        for d in decisions:
+            quality_label = d.get('quality_label', 'unknown')
+            confidence = d.get('decision_data', {}).get('confidence', 0.0)
+            quality_analysis = d.get('outcome_data', {}).get('quality_analysis', {})
+            quality_score = quality_analysis.get('quality_score', 0.5)
+
+            # Always include teaching moments
+            if quality_label == 'teaching_moment' and include_teaching_moments:
+                filtered_decisions.append(d)
+                continue
+
+            # Apply filters
+            if confidence < min_confidence:
+                continue
+            if quality_score < min_quality:
+                continue
+
+            filtered_decisions.append(d)
+
+        # Convert to QLoRA format
+        qlora_records = []
+        for d in filtered_decisions:
+            record = self._decision_to_qlora_format(d)
+            qlora_records.append(record)
+
+        # Write output
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        if format == "jsonl":
+            with open(output_file, 'w') as f:
+                for record in qlora_records:
+                    f.write(json.dumps(record) + '\n')
+        elif format == "parquet":
+            try:
+                import pandas as pd
+                df = pd.DataFrame(qlora_records)
+                df.to_parquet(output_file, index=False)
+            except ImportError:
+                logger.warning("pandas not available, falling back to jsonl")
+                output_file = output_file.with_suffix('.jsonl')
+                with open(output_file, 'w') as f:
+                    for record in qlora_records:
+                        f.write(json.dumps(record) + '\n')
+
+        stats = {
+            "character_id": character_id,
+            "total_decisions": len(decisions),
+            "filtered_decisions": len(filtered_decisions),
+            "exported_records": len(qlora_records),
+            "output_path": str(output_file),
+            "format": format
+        }
+
+        logger.info(f"Exported {len(qlora_records)} QLoRA records to {output_file}")
+        return stats
+
+    def _decision_to_qlora_format(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert a decision to QLoRA training format (Phase 7.2.2)
+
+        Format for instruction tuning:
+        {
+            "instruction": "What action should I take?",
+            "input": "<situation context>",
+            "output": "<decision with reasoning>"
+        }
+        """
+        situation = decision.get('situation_context', {})
+        decision_data = decision.get('decision_data', {})
+        outcome = decision.get('outcome_data', {})
+
+        # Build instruction prompt
+        instruction = self._build_instruction_prompt(decision)
+
+        # Build input (context)
+        input_text = self._build_input_context(situation, decision_data)
+
+        # Build output (the decision and what happened)
+        output_text = self._build_output_text(decision_data, outcome)
+
+        return {
+            "instruction": instruction,
+            "input": input_text,
+            "output": output_text,
+            "metadata": {
+                "decision_id": decision.get('decision_id'),
+                "decision_type": decision_data.get('decision_type', 'unknown'),
+                "quality_label": decision.get('quality_label', 'unknown'),
+                "success": decision.get('success', False),
+                "confidence": decision_data.get('confidence', 0.0)
+            }
+        }
+
+    def _build_instruction_prompt(self, decision: Dict[str, Any]) -> str:
+        """Build the instruction prompt for QLoRA training"""
+        decision_type = decision.get('decision_data', {}).get('decision_type', 'action')
+
+        instructions = {
+            "combat_action": "What combat action should I take in this situation?",
+            "exploration": "How should I proceed with exploration?",
+            "social": "How should I respond in this social situation?",
+            "skill_check": "What skill check should I attempt?",
+            "roleplay": "How should my character respond?",
+            "default": "What action should I take?"
+        }
+
+        return instructions.get(decision_type, instructions["default"])
+
+    def _build_input_context(self, situation: Dict, decision_data: Dict) -> str:
+        """Build the input context from situation data"""
+        parts = []
+
+        # Game state
+        game_state = situation.get('game_state', {})
+        if game_state:
+            if 'location' in game_state:
+                parts.append(f"Location: {game_state['location']}")
+            if 'turn' in game_state:
+                parts.append(f"Turn: {game_state['turn']}")
+            if game_state.get('combat_active'):
+                parts.append("Combat is active")
+            if game_state.get('time'):
+                parts.append(f"Time: {game_state['time']}")
+
+        # Character state
+        char_state = situation.get('character_state', {})
+        if char_state:
+            hp = char_state.get('hp', 0)
+            max_hp = char_state.get('max_hp', hp)
+            parts.append(f"HP: {hp}/{max_hp}")
+
+            if char_state.get('status_effects'):
+                parts.append(f"Status: {', '.join(char_state['status_effects'])}")
+
+        # Perception data
+        perception = situation.get('perception_data', {})
+        if perception:
+            if 'nearby_enemies' in perception:
+                enemies = [e.get('id', 'unknown') for e in perception['nearby_enemies']]
+                parts.append(f"Nearby enemies: {', '.join(enemies)}")
+            if 'nearby_allies' in perception:
+                allies = perception['nearby_allies']
+                parts.append(f"Nearby allies: {', '.join(allies)}")
+
+        # Decision context
+        if 'stakes' in decision_data:
+            parts.append(f"Stakes: {decision_data['stakes']:.1%}")
+
+        return "\n".join(parts) if parts else "No additional context"
+
+    def _build_output_text(self, decision_data: Dict, outcome: Dict) -> str:
+        """Build the output text from decision and outcome"""
+        parts = []
+
+        action = decision_data.get('action', 'unknown action')
+        reasoning = decision_data.get('reasoning', '')
+        confidence = decision_data.get('confidence', 0.0)
+
+        parts.append(f"Action: {action}")
+
+        if reasoning:
+            parts.append(f"Reasoning: {reasoning}")
+
+        parts.append(f"Confidence: {confidence:.0%}")
+
+        # Add outcome information if available
+        if outcome:
+            success = outcome.get('success', False)
+            immediate = outcome.get('immediate', '')
+
+            if immediate:
+                parts.append(f"Result: {immediate}")
+
+            if success:
+                parts.append("This action was successful.")
+            else:
+                parts.append("This action was not successful.")
+
+        return "\n".join(parts)
+
+    def export_for_consolidation(
+        self,
+        character_id: str,
+        output_path: str
+    ) -> Dict[str, Any]:
+        """
+        Export data for memory consolidation (Phase 7 enhanced)
+
+        Converts episodic memories to semantic format for consolidation.
+
+        Args:
+            character_id: Character to export
+            output_path: Output file path
+
+        Returns:
+            Export statistics
+        """
+        decisions = self.get_training_eligible_decisions(character_id)
+
+        # Group by decision type for consolidation
+        by_type = {}
+        for d in decisions:
+            decision_type = d.get('decision_data', {}).get('decision_type', 'unknown')
+            if decision_type not in by_type:
+                by_type[decision_type] = []
+            by_type[decision_type].append(d)
+
+        # Create consolidation records
+        consolidation_data = {
+            "character_id": character_id,
+            "export_timestamp": datetime.utcnow().isoformat(),
+            "episodic_count": len(decisions),
+            "consolidation_groups": []
+        }
+
+        for decision_type, type_decisions in by_type.items():
+            if len(type_decisions) >= 3:  # Only consolidate with 3+ examples
+                group = {
+                    "decision_type": decision_type,
+                    "count": len(type_decisions),
+                    "success_count": sum(1 for d in type_decisions if d.get('success')),
+                    "patterns": self._extract_patterns(type_decisions)
+                }
+                consolidation_data["consolidation_groups"].append(group)
+
+        with open(output_path, 'w') as f:
+            json.dump(consolidation_data, f, indent=2)
+
+        stats = {
+            "character_id": character_id,
+            "total_decisions": len(decisions),
+            "consolidation_groups": len(consolidation_data["consolidation_groups"]),
+            "output_path": str(output_path)
+        }
+
+        logger.info(f"Exported consolidation data with {stats['consolidation_groups']} groups")
+        return stats
+
+    def _extract_patterns(self, decisions: List[Dict]) -> List[str]:
+        """Extract patterns from similar decisions for consolidation"""
+        patterns = []
+
+        # Successful actions
+        successful = [d for d in decisions if d.get('success')]
+        if successful:
+            actions = [d.get('decision_data', {}).get('action', '') for d in successful]
+            # Find common successful actions
+            from collections import Counter
+            common = Counter(actions).most_common(3)
+            for action, count in common:
+                if count >= 2:
+                    patterns.append(f"Successful pattern: {action} ({count} times)")
+
+        # Failed actions to avoid
+        failed = [d for d in decisions if not d.get('success')]
+        if failed:
+            actions = [d.get('decision_data', {}).get('action', '') for d in failed]
+            from collections import Counter
+            common = Counter(actions).most_common(3)
+            for action, count in common:
+                if count >= 2:
+                    patterns.append(f"Failed pattern to avoid: {action} ({count} times)")
+
+        return patterns
     
     def get_session_summary(
         self,
