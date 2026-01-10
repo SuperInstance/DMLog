@@ -9,6 +9,11 @@ Improvements:
 - Quality-aware consolidation (preserves important details)
 - Incremental consolidation (don't wait for full batch)
 - Cross-memory inference (derive new knowledge from patterns)
+
+Phase 7 Enhanced:
+- Integration with training data collector
+- Decision-based consolidation triggers
+- Learning-aware consolidation prioritization
 """
 
 from typing import Dict, List, Any, Optional, Tuple, Set
@@ -19,6 +24,17 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.feature_extraction.text import TfidfVectorizer
 import hashlib
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Import training data collector for Phase 7 integration
+try:
+    from training_data_collector import TrainingDataCollector
+    TRAINING_DATA_AVAILABLE = True
+except ImportError:
+    TRAINING_DATA_AVAILABLE = False
+    logger.warning("TrainingDataCollector not available - decision consolidation disabled")
 
 
 # ============================================================================
@@ -492,11 +508,11 @@ class MemoryInference:
                 
                 if common_words:
                     inference_text = f"Pattern: {actor} often {', '.join(common_words)}"
-                    
+
                     memory_id = hashlib.md5(
                         f"inference_{actor}{datetime.now().isoformat()}".encode()
                     ).hexdigest()[:16]
-                    
+
                     inferred = Memory(
                         id=memory_id,
                         content=inference_text,
@@ -507,5 +523,396 @@ class MemoryInference:
                         consolidation_source_ids=[m.id for m in actor_memories]
                     )
                     inferences.append(inferred)
-        
+
         return inferences
+
+
+# ============================================================================
+# PHASE 7: LEARNING-AWARE CONSOLIDATION
+# ============================================================================
+
+class LearningAwareConsolidation:
+    """
+    Consolidates episodic decisions into semantic knowledge for learning.
+
+    This bridges the gap between:
+    - Raw gameplay decisions (logged by TrainingDataCollector)
+    - Semantic memories (used by MemoryConsolidationEngine)
+    - Training data (used by QLoRA trainer)
+
+    Phase 7.2.2 - Enhanced consolidation for learning pipeline
+    """
+
+    def __init__(
+        self,
+        character_id: str,
+        training_data_collector: Optional[TrainingDataCollector] = None
+    ):
+        """
+        Initialize learning-aware consolidation
+
+        Args:
+            character_id: Character ID
+            training_data_collector: Optional training data collector instance
+        """
+        self.character_id = character_id
+        self.training_collector = training_data_collector
+        self.consolidation_history: List[Dict] = []
+
+        # Consolidation thresholds
+        self.min_decisions_for_consolidation = 10
+        self.consolidation_interval_hours = 24
+        self.last_consolidation: Optional[datetime] = None
+
+    async def consolidate_recent_decisions(
+        self,
+        memory_engine
+    ) -> Dict[str, Any]:
+        """
+        Consolidate recent decisions from training data into semantic memories
+
+        Args:
+            memory_engine: MemoryConsolidationEngine instance
+
+        Returns:
+            Consolidation report
+        """
+        if not self.training_collector:
+            logger.warning("No training data collector - cannot consolidate decisions")
+            return {"triggered": False, "reason": "No training data collector"}
+
+        # Check if enough time has passed
+        if self.last_consolidation:
+            hours_since = (datetime.now() - self.last_consolidation).total_seconds() / 3600
+            if hours_since < self.consolidation_interval_hours:
+                return {
+                    "triggered": False,
+                    "reason": f"Too soon ({hours_since:.1f}h < {self.consolidation_interval_hours}h)"
+                }
+
+        # Get recent decisions from training data
+        decisions = self.training_collector.get_training_eligible_decisions(
+            character_id=self.character_id,
+            limit=100
+        )
+
+        if len(decisions) < self.min_decisions_for_consolidation:
+            return {
+                "triggered": False,
+                "reason": f"Insufficient decisions ({len(decisions)} < {self.min_decisions_for_consolidation})"
+            }
+
+        logger.info(f"Consolidating {len(decisions)} decisions for {self.character_id}")
+
+        # Group by decision type
+        by_type = self._group_by_decision_type(decisions)
+
+        semantic_memories_created = []
+
+        # Consolidate each type group
+        for decision_type, type_decisions in by_type.items():
+            if len(type_decisions) >= 3:  # Need at least 3 examples
+                semantic_memory = self._consolidate_decision_group(
+                    decision_type, type_decisions, memory_engine
+                )
+                if semantic_memory:
+                    semantic_memories_created.append(semantic_memory)
+
+        # Record consolidation
+        self.last_consolidation = datetime.now()
+        self.consolidation_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "decisions_processed": len(decisions),
+            "semantic_created": len(semantic_memories_created)
+        })
+
+        logger.info(f"Created {len(semantic_memories_created)} semantic memories")
+
+        return {
+            "triggered": True,
+            "decisions_processed": len(decisions),
+            "semantic_created": len(semantic_memories_created),
+            "by_type": {k: len(v) for k, v in by_type.items()}
+        }
+
+    def _group_by_decision_type(self, decisions: List[Dict]) -> Dict[str, List[Dict]]:
+        """Group decisions by type for consolidation"""
+        by_type = defaultdict(list)
+
+        for d in decisions:
+            decision_type = d.get('decision_data', {}).get('decision_type', 'unknown')
+            by_type[decision_type].append(d)
+
+        return dict(by_type)
+
+    def _consolidate_decision_group(
+        self,
+        decision_type: str,
+        decisions: List[Dict],
+        memory_engine
+    ) -> Optional[Any]:
+        """
+        Consolidate a group of similar decisions into semantic memory
+
+        Args:
+            decision_type: Type of decision
+            decisions: List of decisions of this type
+            memory_engine: Memory engine to store semantic memory
+
+        Returns:
+            Created Memory object or None
+        """
+        from memory_system import Memory, MemoryType
+
+        # Analyze success patterns
+        successful = [d for d in decisions if d.get('success')]
+        failed = [d for d in decisions if not d.get('success')]
+
+        # Extract successful patterns
+        successful_patterns = self._extract_success_patterns(successful)
+
+        # Extract failure patterns
+        failure_patterns = self._extract_failure_patterns(failed)
+
+        # Build semantic memory content
+        content_parts = []
+
+        if successful_patterns:
+            content_parts.append(f"I have learned from {len(successful)} successful {decision_type} decisions:")
+            for pattern in successful_patterns[:3]:
+                content_parts.append(f"  - {pattern}")
+
+        if failure_patterns:
+            content_parts.append(f"\nI have learned from {len(failed)} failed {decision_type} decisions:")
+            for pattern in failure_patterns[:3]:
+                content_parts.append(f"  - {pattern}")
+
+        if not content_parts:
+            return None
+
+        content = "\n".join(content_parts)
+
+        # Calculate importance based on decision count and success rate
+        success_rate = len(successful) / len(decisions) if decisions else 0.5
+        importance = 5.0 + (len(decisions) * 0.1) + abs(success_rate - 0.5) * 2
+        importance = min(importance, 10.0)
+
+        # Create semantic memory
+        memory_id = hashlib.md5(
+            f"consolidation_{self.character_id}_{decision_type}_{datetime.now().isoformat()}".encode()
+        ).hexdigest()[:16]
+
+        memory = Memory(
+            id=memory_id,
+            content=content,
+            memory_type=MemoryType.SEMANTIC,
+            timestamp=datetime.now(),
+            importance=importance,
+            consolidated=True,
+            consolidation_source_ids=[d.get('decision_id') for d in decisions]
+        )
+
+        # Store in memory engine
+        memory_engine.memories[memory_id] = memory
+
+        return memory
+
+    def _extract_success_patterns(self, successful_decisions: List[Dict]) -> List[str]:
+        """Extract patterns from successful decisions"""
+        patterns = []
+
+        # Get common actions
+        actions = []
+        for d in successful_decisions:
+            action = d.get('decision_data', {}).get('action', '')
+            if action:
+                actions.append(action)
+
+        # Find most common successful actions
+        from collections import Counter
+        common_actions = Counter(actions).most_common(5)
+
+        for action, count in common_actions:
+            if count >= 2:
+                # Get reasoning for this action
+                reasonings = []
+                for d in successful_decisions:
+                    if d.get('decision_data', {}).get('action') == action:
+                        reasoning = d.get('decision_data', {}).get('reasoning', '')
+                        if reasoning:
+                            reasonings.append(reasoning)
+
+                if reasonings:
+                    # Build pattern description
+                    pattern = f"When I {action}, it tends to work"
+                    if len(reasonings) >= 2:
+                        pattern += " (reasons include: "
+                        pattern += ", ".join(reasonings[:2])
+                        pattern += ")"
+                    patterns.append(pattern)
+
+        return patterns
+
+    def _extract_failure_patterns(self, failed_decisions: List[Dict]) -> List[str]:
+        """Extract patterns from failed decisions"""
+        patterns = []
+
+        if not failed_decisions:
+            return patterns
+
+        # Get common actions that failed
+        actions = []
+        for d in failed_decisions:
+            action = d.get('decision_data', {}).get('action', '')
+            if action:
+                actions.append(action)
+
+        from collections import Counter
+        common_actions = Counter(actions).most_common(5)
+
+        for action, count in common_actions:
+            if count >= 2:
+                pattern = f"I should be careful when I {action} (failed {count} times)"
+                patterns.append(pattern)
+
+        return patterns
+
+    def get_consolidation_summary(self) -> Dict[str, Any]:
+        """Get summary of consolidation history"""
+        if not self.consolidation_history:
+            return {"message": "No consolidations yet"}
+
+        total_decisions = sum(e["decisions_processed"] for e in self.consolidation_history)
+        total_semantic = sum(e["semantic_created"] for e in self.consolidation_history)
+
+        return {
+            "total_consolidations": len(self.consolidation_history),
+            "total_decisions_processed": total_decisions,
+            "total_semantic_created": total_semantic,
+            "last_consolidation": self.last_consolidation.isoformat() if self.last_consolidation else None,
+            "compression_ratio": total_decisions / total_semantic if total_semantic > 0 else 0
+        }
+
+
+class DreamCycleCoordinator:
+    """
+    Coordinates the dream cycle for character learning.
+
+    The dream cycle is the Phase 7 learning process:
+    1. ACTIVE - Character plays, decisions logged
+    2. DREAMING - Session ends, prepare for training
+    3. TRAINING - QLoRA fine-tuning
+    4. AWAKENING - Load new model weights
+    5. ACTIVE - Character returns improved
+
+    Phase 7.3 - Dream cycle orchestration
+    """
+
+    def __init__(
+        self,
+        character_id: str,
+        training_data_collector: Optional[TrainingDataCollector] = None,
+        min_decisions_for_training: int = 100,
+        min_teaching_moments: int = 10
+    ):
+        """
+        Initialize dream cycle coordinator
+
+        Args:
+            character_id: Character ID
+            training_data_collector: Training data collector instance
+            min_decisions_for_training: Minimum decisions before training
+            min_teaching_moments: Minimum teaching moments before training
+        """
+        self.character_id = character_id
+        self.training_collector = training_data_collector
+        self.min_decisions = min_decisions_for_training
+        self.min_teaching_moments = min_teaching_moments
+
+        self.state = CharacterState.ACTIVE
+        self.state_history: List[Dict] = []
+
+    def should_trigger_dream_cycle(self) -> Tuple[bool, str]:
+        """
+        Check if dream cycle should be triggered
+
+        Returns:
+            (should_trigger, reason)
+        """
+        if not self.training_collector:
+            return False, "No training data collector"
+
+        stats = self.training_collector.get_statistics(
+            character_id=self.character_id
+        )
+
+        total_decisions = stats.get("total_decisions", 0)
+        teaching_moments = stats.get("by_quality", {}).get("teaching_moment", 0)
+
+        if total_decisions >= self.min_decisions:
+            return True, f"Reached {total_decisions} decisions (threshold: {self.min_decisions})"
+
+        if teaching_moments >= self.min_teaching_moments:
+            return True, f"Reached {teaching_moments} teaching moments (threshold: {self.min_teaching_moments})"
+
+        return False, f"Not enough data: {total_decisions}/{self.min_decisions} decisions, {teaching_moments}/{self.min_teaching_moments} teaching moments"
+
+    def transition_to(self, new_state: CharacterState) -> bool:
+        """
+        Transition to a new state
+
+        Args:
+            new_state: New state to transition to
+
+        Returns:
+            True if transition allowed, False otherwise
+        """
+        # Define allowed transitions
+        allowed_transitions = {
+            CharacterState.ACTIVE: [CharacterState.DREAMING],
+            CharacterState.DREAMING: [CharacterState.TRAINING, CharacterState.ACTIVE],
+            CharacterState.TRAINING: [CharacterState.AWAKENING, CharacterState.ERROR],
+            CharacterState.AWAKENING: [CharacterState.ACTIVE],
+            CharacterState.ERROR: [CharacterState.ACTIVE]
+        }
+
+        if new_state not in allowed_transitions.get(self.state, []):
+            logger.warning(f"Invalid state transition: {self.state} -> {new_state}")
+            return False
+
+        logger.info(f"Character {self.character_id}: {self.state} -> {new_state}")
+
+        # Record transition
+        self.state_history.append({
+            "from": self.state.value,
+            "to": new_state.value,
+            "timestamp": datetime.now().isoformat()
+        })
+
+        self.state = new_state
+        return True
+
+    def get_state(self) -> CharacterState:
+        """Get current character state"""
+        return self.state
+
+    def get_state_history(self) -> List[Dict]:
+        """Get state transition history"""
+        return self.state_history.copy()
+
+
+# Import CharacterState from qlora_training if available
+try:
+    from qlora_training import CharacterState as QLoRACharacterState
+    CharacterState = QLoRACharacterState
+except ImportError:
+    # Define locally if not available
+    from enum import Enum
+
+    class CharacterState(Enum):
+        """States during learning cycle"""
+        ACTIVE = "active"
+        DREAMING = "dreaming"
+        TRAINING = "training"
+        AWAKENING = "awakening"
+        ERROR = "error"
