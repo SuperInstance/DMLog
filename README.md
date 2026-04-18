@@ -2,6 +2,16 @@
 
 A D&D simulator where AI characters develop through lived experiences using **temporal consciousness** and **cultural transmission**. Characters have personal memories, learn from each other, and evolve through gameplay.
 
+## 📚 Documentation
+
+Comprehensive documentation is available in the [docs/](docs/) directory:
+
+- **[INDEX.md](docs/INDEX.md)** - Documentation hub and navigation guide
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Complete system architecture and design
+- **[DEVELOPER.md](docs/DEVELOPER.md)** - Developer guide with API reference
+- **[USER_GUIDE.md](docs/USER_GUIDE.md)** - User documentation and tutorials
+- **[EXAMPLES.md](docs/EXAMPLES.md)** - Practical examples and use cases
+
 ## 🎯 Core Features
 
 ### **1. Temporal Consciousness**
